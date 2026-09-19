@@ -58,6 +58,10 @@ LIPSYNC_BACKEND = os.environ.get("LIPSYNC_BACKEND", "latentsync")
 # anything. "none" disables it (and saves the render time) for a plain render.
 MATTE_BACKEND = os.environ.get("MATTE_BACKEND", "ben2")
 MATTE_REFINE = os.environ.get("MATTE_REFINE", "1") not in ("0", "false", "off", "")
+# "webm" (default) ships BEN2's VP9-with-alpha output as-is: small and playable in
+# any browser. "prores" additionally transcodes to ProRes 4444 for editors that
+# will not take VP9 alpha — at roughly 10x the file size for a 19s clip.
+MATTE_FORMAT = os.environ.get("MATTE_FORMAT", "webm")
 MATTE_PYTHON = os.environ.get("MATTE_PYTHON") or os.environ.get("LATENTSYNC_PYTHON", sys.executable)
 HERE = Path(__file__).parent
 
@@ -382,8 +386,11 @@ def render(job, work: Path):
         call("POST", f"/jobs/{jid}/progress", {"step": 5})
         try:
             webm = matte_ben2(final, work)
-            alpha = to_prores_alpha(webm, work)
-            log(f"  alpha {alpha.stat().st_size/1e6:.1f} MB (ProRes 4444 + alpha)")
+            if MATTE_FORMAT == "prores":
+                alpha = to_prores_alpha(webm, work)
+            else:
+                alpha = webm          # VP9 + alpha: small, browser-playable
+            log(f"  alpha {alpha.stat().st_size/1e6:.1f} MB ({alpha.suffix.strip('.')}, alpha channel)")
         except Exception as e:
             log(f"  matte failed (non-fatal): {type(e).__name__}: {e}")
             alpha = None
@@ -414,7 +421,7 @@ def beacon():
             "tts": TTS_BACKEND,
             "lipsync": LIPSYNC_BACKEND,
             "latentsync": latentsync_settings(),
-            "matte": {"backend": MATTE_BACKEND, "refine": MATTE_REFINE},
+            "matte": {"backend": MATTE_BACKEND, "refine": MATTE_REFINE, "format": MATTE_FORMAT},
         }, timeout=30)
     except Exception as e:
         log("  beacon failed (non-fatal):", e)
