@@ -17,6 +17,14 @@ paywall, front end) can be exercised on a machine with no GPU. Its output is NOT
 a clone — the mouth does not match the words — so it burns an unmissable label
 into the video. Never ship it to a client.
 
+Two ways a job produces a talking face, chosen by the job's `mode`:
+
+  lipsync   (default) the client recorded a take; only the mouth is rewritten, so the
+            pixels are genuinely theirs. Needs a take.
+  generate  the client sent a single photo; EchoMimicV3 (Apache-2.0) synthesises the
+            whole frame. Needs a photo and a voice reference, no footage at all. The
+            result is a likeness rather than a recording.
+
 The worker PULLS work: the pod needs no inbound network, public IP or port
 forwarding, and can be started and killed freely.
 
@@ -63,6 +71,10 @@ MATTE_REFINE = os.environ.get("MATTE_REFINE", "1") not in ("0", "false", "off", 
 # will not take VP9 alpha — at roughly 10x the file size for a 19s clip.
 MATTE_FORMAT = os.environ.get("MATTE_FORMAT", "webm")
 MATTE_PYTHON = os.environ.get("MATTE_PYTHON") or os.environ.get("LATENTSYNC_PYTHON", sys.executable)
+# EchoMimicV3 (photo -> talking video). Its own venv and checkout: it needs torch 2.5.1
+# + a pile of extra deps (tensorflow, moviepy) that must not touch the lip-sync venv.
+EM_REPO = os.environ.get("EM_REPO", "/workspace/echomimic_v3")
+EM_PYTHON = os.environ.get("EM_PYTHON", "/workspace/emvenv/bin/python")
 HERE = Path(__file__).parent
 
 
@@ -407,6 +419,82 @@ def render(job, work: Path):
     log(f"  DONE {jid}")
 
 
+def render_generate(job, work: Path):
+    """A still photo + the script -> a talking video, generated end to end.
+
+    The other path (render()) rewrites the mouth on footage the client actually
+    recorded, so every pixel outside the mouth is genuinely theirs. This path has no
+    footage at all: the photo IS the face, and EchoMimicV3 synthesises the whole frame
+    — head motion, expression, body. The result is a *likeness* rather than a
+    recording, which is exactly why it can look more natural than a 512px mouth pasted
+    into a real video, and exactly why the client must know the difference.
+
+    The voice still comes from the client: the voice reference is a real recording
+    pinned on the API, so the clone speaks the script in their own voice.
+    """
+    jid = job["id"]
+    photo = work / ("photo." + job.get("ext", "jpg"))
+    download(f"/jobs/{jid}/take", photo)
+    log(f"  photo {photo.stat().st_size/1e6:.2f} MB")
+
+    # 1. narration in the client's voice. There is no take here to clone a voice from,
+    # so we use the reference pinned on the API instead.
+    call("POST", f"/jobs/{jid}/progress", {"step": 2})
+    voice_ref = work / "voice_ref.wav"
+    download("/worker/voice_ref", voice_ref)
+    narration = work / ("narration.mp3" if TTS_BACKEND == "elevenlabs" else "narration.wav")
+    lang = job.get("language") or detect_language(job["script"])
+    log(f"  tts: {TTS_BACKEND}, voice reference {voice_ref.stat().st_size/1e6:.2f} MB")
+    if TTS_BACKEND == "elevenlabs":
+        tts_elevenlabs(job["script"], narration)
+    else:
+        tts_chatterbox(job["script"], voice_ref, narration, work, lang)
+    normalize_narration(narration, os.environ.get("NARRATION_LUFS", "-16"))
+    log(f"  narration {probe_duration(narration):.1f}s")
+
+    # 2. generate the video. Length follows the audio: int(duration * 25) frames.
+    call("POST", f"/jobs/{jid}/progress", {"step": 3})
+    if not Path(EM_PYTHON).exists():
+        raise RuntimeError(
+            f"EchoMimic is not installed on this pod ({EM_PYTHON} missing). Set "
+            f"INSTALL_ECHOMIMIC=1 in the pod env and restart — the install pulls ~22 GB.")
+    em_out = work / "em"
+    env = dict(os.environ)
+    env.update({
+        "EM_IMAGE": str(photo), "EM_AUDIO": str(narration), "EM_OUT": str(em_out),
+        "EM_REPO": EM_REPO,
+        # 5 steps is the model's own recommendation for a talking head; 15-25 is for
+        # talking body with hand gestures. Set EM_STEPS=20 on the pod for more motion.
+        "EM_STEPS": os.environ.get("EM_STEPS", "5"),
+        "EM_PARTIAL": os.environ.get("EM_PARTIAL", "113"),
+        "EM_SEED": os.environ.get("EM_SEED", "43"),
+    })
+    log(f"  echomimic: steps={env['EM_STEPS']} chunk={env['EM_PARTIAL']} seed={env['EM_SEED']}")
+    proc = subprocess.run([EM_PYTHON, str(HERE / "em_driver.py")], env=env, cwd=str(HERE))
+    if proc.returncode != 0:
+        raise RuntimeError(f"EchoMimic driver exited {proc.returncode}")
+    produced = em_out / "final.mp4"
+    if not produced.exists():
+        raise RuntimeError("EchoMimic reported success but produced no final.mp4")
+    final = work / "final.mp4"
+    shutil.move(str(produced), final)
+    log(f"  final {final.stat().st_size/1e6:.1f} MB, {probe_duration(final):.1f}s")
+
+    # 3. watermark + upload. No alpha matte on this path: the frame is generated whole,
+    # so there is no cut-out to make — the client gets the scene as the model made it.
+    # (The tail duplicates render()'s on purpose: render() is the path that earns money
+    # and is not worth refactoring for ~15 lines of shared code.)
+    call("POST", f"/jobs/{jid}/progress", {"step": 4})
+    preview = work / "preview.mp4"
+    run(["bash", str(HERE / "watermark.sh"), str(final), str(preview)])
+    for kind, p in (("final", final), ("preview", preview)):
+        with open(p, "rb") as f:
+            call("PUT", f"/jobs/{jid}/result/{kind}", raw=f.read(), timeout=1800)
+        log(f"  uploaded {kind} ({p.stat().st_size/1e6:.1f} MB)")
+    call("POST", f"/jobs/{jid}/done", {})
+    log(f"  DONE {jid} (generated from photo)")
+
+
 def beacon():
     """Tell the API which code and settings this pod is actually running.
 
@@ -422,6 +510,12 @@ def beacon():
             "lipsync": LIPSYNC_BACKEND,
             "latentsync": latentsync_settings(),
             "matte": {"backend": MATTE_BACKEND, "refine": MATTE_REFINE, "format": MATTE_FORMAT},
+            # Whether the photo->video path can actually run on this pod. Reported here
+            # because the install is optional and non-fatal, so "is EchoMimic ready?" is
+            # otherwise only answerable by reading pod logs.
+            "echomimic": {"repo": EM_REPO, "installed": Path(EM_PYTHON).exists(),
+                          "steps": os.environ.get("EM_STEPS", "5"),
+                          "partial": os.environ.get("EM_PARTIAL", "113")},
         }, timeout=30)
     except Exception as e:
         log("  beacon failed (non-fatal):", e)
@@ -531,7 +625,7 @@ def main():
     idle = 0
     while True:
         try:
-            job = call("GET", "/work?v=2", timeout=60)
+            job = call("GET", "/work?v=3", timeout=60)
         except urllib.error.HTTPError as e:
             log("api error", e.code); time.sleep(POLL); continue
         except Exception as e:
@@ -556,6 +650,9 @@ def main():
                 task_part(job, work)
             elif task == "finish":
                 task_finish(job, work)
+            elif job.get("mode") == "generate":
+                # No footage: the client sent a photo and the frame is generated.
+                render_generate(job, work)
             else:
                 render(job, work)
             ok = True

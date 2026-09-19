@@ -253,5 +253,7 @@ exec env \
   LATENTSYNC_DIR="$LS_DIR" \
   LATENTSYNC_PYTHON="$LS_VENV/bin/python" \
   LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-latentsync}" \
+  EM_REPO="${EM_DIR:-/workspace/echomimic_v3}" \
+  EM_PYTHON="${EM_VENV:-/workspace/emvenv}/bin/python" \
   IDLE_EXIT="${IDLE_EXIT:-0}" \
   python run_worker.py
