@@ -67,15 +67,36 @@ say "3/6  MuseTalk weights (~10 GB — slowest step)"
 pip install -q -U "huggingface_hub" gdown
 python "$WORKER_DIR_SRC/download_weights.py" --dir "$MUSETALK_DIR/models"
 
-say "4/6  Chatterbox TTS (multilingual: en / he / ar)"
-# NOTE: chatterbox-tts depends on a much newer torch and WILL upgrade the
-# 2.0.1 pin installed above (observed: 2.0.1 -> 2.6.0 on a real pod). Chatterbox
-# works fine on the newer torch; MuseTalk's mmlab stack is the fragile one.
-# Install it, then report what torch actually survived so the log tells the truth.
-pip install -q chatterbox-tts
+say "4/6  Chatterbox TTS — in its OWN venv"
+# Chatterbox and MuseTalk require INCOMPATIBLE torch versions and cannot share
+# an environment. Installing chatterbox-tts into the system python upgrades
+# torch 2.0.1 -> 2.6.0, which breaks mmcv's precompiled ops at import:
+#   ImportError: mmcv/_ext...so: undefined symbol: _ZN2at4_ops10zeros_like4call
+# (observed on a real pod, 2026-09-19). mmcv 2.0.1 is compiled against the
+# torch 2.0.1 C++ ABI; nothing short of matching that ABI fixes it.
+#
+# So Chatterbox gets an isolated venv with its own torch. MuseTalk keeps the
+# system python untouched. The worker invokes the venv via CHATTERBOX_PYTHON.
+CB_VENV="${CB_VENV:-/workspace/cbvenv}"
+if [ ! -x "$CB_VENV/bin/python" ]; then
+  python -m venv "$CB_VENV"
+fi
+"$CB_VENV/bin/pip" install -q --upgrade pip
+"$CB_VENV/bin/pip" install -q chatterbox-tts
+
+echo "     chatterbox venv: $("$CB_VENV/bin/python" -c 'import torch;print("torch",torch.__version__)')"
+echo "     system python  : $(python -c 'import torch;print("torch",torch.__version__)')"
+
+# Guard: the system torch MUST still match what mmcv was built against.
 python - <<'EOF'
-import torch, torchvision
-print(f"     after chatterbox: torch {torch.__version__}, torchvision {torchvision.__version__}")
+import sys, torch
+if not torch.__version__.startswith("2.0"):
+    sys.exit(
+        f"FATAL: system torch is {torch.__version__}, but mmcv was compiled for 2.0.x.\n"
+        "       Something upgraded torch in the system env — MuseTalk will fail at\n"
+        "       'mmcv/_ext...so: undefined symbol'. Keep new-torch packages in venvs."
+    )
+print("     system torch still 2.0.x — mmcv ABI intact")
 EOF
 
 say "5/6  worker files"
@@ -106,6 +127,7 @@ exec env \
   WORKER_TOKEN="$WORKER_TOKEN" \
   MUSETALK_DIR="$MUSETALK_DIR" \
   TTS_BACKEND="${TTS_BACKEND:-chatterbox}" \
+  CHATTERBOX_PYTHON="${CB_VENV:-/workspace/cbvenv}/bin/python" \
   LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-musetalk}" \
   IDLE_EXIT="${IDLE_EXIT:-0}" \
   python run_worker.py

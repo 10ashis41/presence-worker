@@ -117,9 +117,13 @@ def tts_elevenlabs(script: str, out: Path):
 
 
 def tts_chatterbox(script: str, reference: Path, out: Path, work: Path, lang: str):
+    # Chatterbox lives in its own venv: it needs a much newer torch than
+    # MuseTalk, and sharing one environment breaks mmcv's compiled ops
+    # (undefined symbol at import). CHATTERBOX_PYTHON points at that venv.
+    py = os.environ.get("CHATTERBOX_PYTHON", sys.executable)
     txt = work / "script.txt"
     txt.write_text(script, encoding="utf-8")
-    run([sys.executable, str(HERE / "tts_chatterbox.py"),
+    run([py, str(HERE / "tts_chatterbox.py"),
          "--reference", str(reference), "--text-file", str(txt),
          "--out", str(out), "--language", lang])
 
