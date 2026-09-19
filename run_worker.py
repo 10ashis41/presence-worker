@@ -43,7 +43,7 @@ Env:
                     down instead of billing you to sit idle (0 = never)
     ONESHOT         1 = process a single job then exit (used by the smoke test)
 """
-import json, os, shutil, subprocess, sys, tempfile, time
+import json, os, shutil, socket, subprocess, sys, tempfile, time
 from pathlib import Path
 import urllib.request, urllib.error
 
@@ -202,6 +202,24 @@ def lipsync_musetalk(take: Path, narration: Path, work: Path) -> Path:
     return produced[-1]
 
 
+def latentsync_settings() -> dict:
+    """Resolved LatentSync settings, read once from env.
+
+    Single source of truth so the startup beacon reports exactly what the
+    render will use — otherwise we're guessing whether a restart picked up a
+    change. Quality defaults (2026-09-19): 40 steps and DeepCache OFF, because
+    DeepCache is an approximation that smears the high-frequency mouth detail
+    we're trying to fix.
+    """
+    return {
+        "steps": int(os.environ.get("LATENTSYNC_STEPS", "40")),
+        "guidance": float(os.environ.get("LATENTSYNC_GUIDANCE", "1.5")),
+        "seed": int(os.environ.get("LATENTSYNC_SEED", "1247")),
+        "deepcache": os.environ.get("LATENTSYNC_DEEPCACHE", "0") not in ("0", "false", "off", ""),
+        "narration_lufs": os.environ.get("NARRATION_LUFS", "-16"),
+    }
+
+
 def lipsync_latentsync(take: Path, narration: Path, work: Path) -> Path:
     """LatentSync 1.6 (ByteDance, Apache-2.0) — the quality option.
 
@@ -218,28 +236,20 @@ def lipsync_latentsync(take: Path, narration: Path, work: Path) -> Path:
         raise RuntimeError(f"LatentSync checkpoint missing: {ckpt}")
 
     out = work / "latentsync_out.mp4"
-    steps = os.environ.get("LATENTSYNC_STEPS", "20")        # 20-50, higher = better + slower
-    guidance = os.environ.get("LATENTSYNC_GUIDANCE", "1.5")  # 1.0-3.0, higher = tighter sync, more jitter
-    # Pin the seed so an A/B between settings compares the settings, not luck,
-    # and so a good render can be reproduced. 1247 is LatentSync's own default.
-    seed = os.environ.get("LATENTSYNC_SEED", "1247")
-    # DeepCache caches UNet features to go faster. It is an APPROXIMATION, and
-    # it lands on exactly the high-frequency detail we care about — lips and
-    # teeth. Default keeps today's behaviour (on); set LATENTSYNC_DEEPCACHE=0
-    # for a quality pass. It is the cheapest A/B against mouth blotching.
-    deepcache = os.environ.get("LATENTSYNC_DEEPCACHE", "1") not in ("0", "false", "off", "")
+    s = latentsync_settings()
     args = [py, "-m", "scripts.inference",
             "--unet_config_path", str(ls_dir / "configs/unet/stage2_512.yaml"),
             "--inference_ckpt_path", str(ckpt),
-            "--inference_steps", steps,
-            "--guidance_scale", guidance,
-            "--seed", seed]
-    if deepcache:
+            "--inference_steps", str(s["steps"]),
+            "--guidance_scale", str(s["guidance"]),
+            "--seed", str(s["seed"])]
+    if s["deepcache"]:
         args.append("--enable_deepcache")
     args += ["--video_path", str(take.resolve()),
              "--audio_path", str(narration.resolve()),
              "--video_out_path", str(out)]
-    log(f"  latentsync: steps={steps} guidance={guidance} seed={seed} deepcache={deepcache}")
+    log(f"  latentsync: steps={s['steps']} guidance={s['guidance']} seed={s['seed']} "
+        f"deepcache={s['deepcache']} narration_lufs={s['narration_lufs']}")
     run(args, cwd=str(ls_dir))
     if not out.exists():
         raise RuntimeError("LatentSync produced no output file")
@@ -313,10 +323,30 @@ def render(job, work: Path):
     log(f"  DONE {jid}")
 
 
+def beacon():
+    """Tell the API which code and settings this pod is actually running.
+
+    Without this there is no way to tell from outside whether a restart picked
+    up a new worker revision or a changed env var — we'd be inferring it from
+    render duration, or guessing. Best-effort: never let it break the worker.
+    """
+    try:
+        call("POST", "/worker/hello", {
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "tts": TTS_BACKEND,
+            "lipsync": LIPSYNC_BACKEND,
+            "latentsync": latentsync_settings(),
+        }, timeout=30)
+    except Exception as e:
+        log("  beacon failed (non-fatal):", e)
+
+
 def main():
     log(f"worker up — api={API} tts={TTS_BACKEND} lipsync={LIPSYNC_BACKEND}")
     if LIPSYNC_BACKEND == "passthrough":
         log("  !! passthrough mode: output is NOT a clone. Pipeline testing only.")
+    beacon()
     idle = 0
     while True:
         try:
