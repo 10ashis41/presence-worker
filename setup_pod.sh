@@ -158,6 +158,44 @@ else
   echo "     skipped (INSTALL_LATENTSYNC=0)"
 fi
 
+say "5b/7  BEN2 matting (MIT, commercial-safe)"
+# Cuts the finished clone out of its background so it can be placed over any
+# scene. Installed into the LatentSync venv on purpose: that venv already has a
+# CUDA torch 2.5.1 and torchvision, so ben2 adds only timm/einops instead of a
+# second ~2.5 GB torch download (provisioning time is the scarce resource here —
+# a restart already costs ~10 minutes).
+#
+# Why not RVM: it is the obvious human video-matting model, but the repo was
+# re-released under GPL-3.0. Copyleft is not something to ship inside a product
+# we sell. BEN2 is MIT. Licence table in COMPOSITING.md.
+if [ "${INSTALL_BEN2:-1}" = "1" ]; then
+  "$LS_VENV/bin/pip" install -q -e "git+https://github.com/PramaLLC/BEN2.git#egg=ben2"
+  # ben2's requirements list omits opencv, but segment_video uses cv2. LatentSync
+  # already pulls opencv in, so only install if it is genuinely missing.
+  if ! "$LS_VENV/bin/python" -c "import cv2" 2>/dev/null; then
+    "$LS_VENV/bin/pip" install -q opencv-python-headless
+  fi
+  # Guard: installing ben2 must not have moved torch. The lip-sync path depends
+  # on this venv's torch, and a silent upgrade would break it in a way that only
+  # shows up mid-render.
+  "$LS_VENV/bin/python" - <<'EOF'
+import sys, torch
+if not torch.__version__.startswith("2.5"):
+    sys.exit(f"FATAL: LatentSync venv torch became {torch.__version__} (expected 2.5.x) — "
+             "installing BEN2 upgraded it. LatentSync will fail. Pin the install.")
+print(f"     ben2 ok; LatentSync venv torch still {torch.__version__}")
+EOF
+  # Fetch weights into the persistent HF cache so a pod restart does not re-download.
+  HF_HOME="$HF_HOME" "$LS_VENV/bin/python" - <<'EOF'
+import os
+os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+from huggingface_hub import snapshot_download
+print("     BEN2 weights:", snapshot_download("PramaLLC/BEN2"))
+EOF
+else
+  echo "     skipped (INSTALL_BEN2=0)"
+fi
+
 say "6/7  worker files"
 mkdir -p "$WORKER_DIR"
 if [ ! -f "$WORKER_DIR/run_worker.py" ]; then

@@ -54,6 +54,11 @@ IDLE_EXIT = int(os.environ.get("IDLE_EXIT", "0"))
 ONESHOT = os.environ.get("ONESHOT") == "1"
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "chatterbox")
 LIPSYNC_BACKEND = os.environ.get("LIPSYNC_BACKEND", "latentsync")
+# Matting cuts the finished clone out of its background so it can be placed over
+# anything. "none" disables it (and saves the render time) for a plain render.
+MATTE_BACKEND = os.environ.get("MATTE_BACKEND", "ben2")
+MATTE_REFINE = os.environ.get("MATTE_REFINE", "1") not in ("0", "false", "off", "")
+MATTE_PYTHON = os.environ.get("MATTE_PYTHON") or os.environ.get("LATENTSYNC_PYTHON", sys.executable)
 HERE = Path(__file__).parent
 
 
@@ -274,6 +279,61 @@ def lipsync_passthrough(take: Path, narration: Path, work: Path) -> Path:
     return out
 
 
+def matte_ben2(clip: Path, work: Path) -> Path:
+    """Cut the person out of the finished clone. Returns a WebM with alpha.
+
+    Model choice: BEN2 (MIT, commercial-safe) also has a video path that emits an
+    alpha channel, which is what we need. RVM is the obvious video-matting model
+    but it is **GPL-3.0** — copyleft, not something to ship inside a product we
+    sell. See COMPOSITING.md for the licence table.
+
+    Why the FINISHED clip and not the take: one matte then serves any number of
+    scenes with no re-render, and LatentSync only rewrites the mouth region, so
+    the cut-out stays valid for a given take.
+
+    Runs in the LatentSync venv on purpose — it already has a CUDA torch 2.5.1,
+    so BEN2 only adds timm/einops rather than a second ~2.5 GB torch download.
+    """
+    outdir = work / "matte"
+    outdir.mkdir(exist_ok=True)
+    script = work / "run_ben2.py"
+    script.write_text(
+        "import os, torch\n"
+        "os.environ.setdefault('HF_HOME', '/workspace/hf-cache')\n"
+        "os.environ.setdefault('HF_HUB_DISABLE_TELEMETRY', '1')\n"
+        "from ben2 import BEN_Base\n"
+        "dev = torch.device('cuda' if torch.cuda.is_available() else 'cpu')\n"
+        "model = BEN_Base.from_pretrained('PramaLLC/BEN2')\n"
+        "model.to(dev).eval()\n"
+        f"model.segment_video(video_path={str(clip.resolve())!r},\n"
+        f"                    output_path={str(outdir.resolve())!r},\n"
+        f"                    fps=0, refine_foreground={MATTE_REFINE!r}, batch=1,\n"
+        "                    print_frames_processed=False, webm=True)\n"
+    )
+    log(f"  matte: ben2 (refine_foreground={MATTE_REFINE}) via {MATTE_PYTHON}")
+    run([MATTE_PYTHON, str(script)], cwd=str(work))
+    produced = sorted(outdir.glob("*.webm"), key=lambda f: f.stat().st_mtime)
+    if not produced:
+        raise RuntimeError("BEN2 produced no alpha output")
+    return produced[-1]
+
+
+def to_prores_alpha(webm: Path, work: Path) -> Path:
+    """WebM VP9 alpha -> ProRes 4444 .mov.
+
+    VP9-in-WebM carries alpha and plays in a browser, but editor support is
+    patchy. ProRes 4444 with yuva444p10le is the same alpha in a container every
+    editor opens, which is the point of handing Eric an asset he can place himself.
+    """
+    out = work / "alpha.mov"
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(webm),
+         "-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le",
+         "-vendor", "apl0", "-movflags", "+faststart", str(out)])
+    if not out.exists():
+        raise RuntimeError("ProRes alpha conversion produced nothing")
+    return out
+
+
 # ---------------------------------------------------------------- job
 def render(job, work: Path):
     jid = job["id"]
@@ -314,8 +374,25 @@ def render(job, work: Path):
     preview = work / "preview.mp4"
     run(["bash", str(HERE / "watermark.sh"), str(final), str(preview)])
 
-    # 4. upload both, then mark done
-    for kind, p in (("final", final), ("preview", preview)):
+    # 3b. matte the clone so it can be dropped over any background or scene.
+    # Never fail a finished render over the extra deliverable: a matte that
+    # breaks leaves final.mp4 exactly as it would have been.
+    alpha = None
+    if MATTE_BACKEND != "none":
+        call("POST", f"/jobs/{jid}/progress", {"step": 5})
+        try:
+            webm = matte_ben2(final, work)
+            alpha = to_prores_alpha(webm, work)
+            log(f"  alpha {alpha.stat().st_size/1e6:.1f} MB (ProRes 4444 + alpha)")
+        except Exception as e:
+            log(f"  matte failed (non-fatal): {type(e).__name__}: {e}")
+            alpha = None
+
+    # 4. upload, then mark done
+    uploads = [("final", final), ("preview", preview)]
+    if alpha:
+        uploads.append(("alpha", alpha))
+    for kind, p in uploads:
         with open(p, "rb") as f:
             call("PUT", f"/jobs/{jid}/result/{kind}", raw=f.read(), timeout=1800)
         log(f"  uploaded {kind} ({p.stat().st_size/1e6:.1f} MB)")
@@ -337,6 +414,7 @@ def beacon():
             "tts": TTS_BACKEND,
             "lipsync": LIPSYNC_BACKEND,
             "latentsync": latentsync_settings(),
+            "matte": {"backend": MATTE_BACKEND, "refine": MATTE_REFINE},
         }, timeout=30)
     except Exception as e:
         log("  beacon failed (non-fatal):", e)
