@@ -7,9 +7,14 @@
 # Installs MuseTalk + Chatterbox, fetches weights, then starts the worker.
 # Safe to re-run: every step is idempotent.
 #
-# Versions are pinned to what MuseTalk's own README specifies (torch 2.0.1 /
-# cu118, mmcv 2.0.1). Do NOT "upgrade" these — the mmlab stack is extremely
-# version-sensitive and newer torch silently breaks mmcv's compiled ops.
+# Versions are pinned to what MuseTalk's own README specifies (Python 3.10,
+# torch 2.0.1 / cu118, mmcv 2.0.1). Do NOT "upgrade" these — the mmlab stack is
+# extremely version-sensitive and newer torch silently breaks mmcv's compiled ops.
+#
+# BASE IMAGE MATTERS: use runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04.
+# An Ubuntu 24.04 image gives Python 3.12, for which torch 2.0.1 has no wheels at
+# all — pip fails with "Could not find a version that satisfies torch==2.0.1"
+# (verified on a real pod, 2026-09-19).
 set -euo pipefail
 
 : "${WORKER_TOKEN:?set WORKER_TOKEN first (see api/.env on the VM)}"
@@ -18,6 +23,15 @@ MUSETALK_DIR="${MUSETALK_DIR:-/workspace/MuseTalk}"
 WORKER_DIR="${WORKER_DIR:-/workspace/presence-worker}"
 
 say(){ printf "\n\033[1;32m==> %s\033[0m\n" "$1"; }
+
+PYV=$(python -c "import sys;print(f'{sys.version_info.major}.{sys.version_info.minor}')")
+if [ "$PYV" != "3.10" ]; then
+  echo "FATAL: Python $PYV detected, but MuseTalk needs 3.10." >&2
+  echo "       torch 2.0.1 has no wheels for $PYV, so the install cannot succeed." >&2
+  echo "       Use base image runpod/pytorch:2.1.0-py3.10-cuda11.8.0-devel-ubuntu22.04" >&2
+  exit 1
+fi
+echo "python $PYV — ok"
 
 say "1/6  system packages"
 apt-get update -qq
