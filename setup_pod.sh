@@ -53,6 +53,14 @@ apt-get update -qq
 apt-get install -y -qq ffmpeg git wget fonts-dejavu-core libgl1 libglib2.0-0 >/dev/null
 
 say "2/6  MuseTalk"
+# MuseTalk's quality was REJECTED (256px mouth region = "melting"), and LatentSync is the
+# lip-sync backend in production. Its weights are ~10 GB of a 50 GB volume that must now
+# also hold EchoMimic's ~28 GB, so it is opt-out rather than deleted-outright:
+# INSTALL_MUSETALK=0 skips steps 2 and 3 entirely. (The `if/else` below is deliberately
+# unindented — an indentation-only diff over 30 lines is how shell scripts get broken.)
+if [ "${INSTALL_MUSETALK:-1}" != "1" ]; then
+  echo "     SKIPPED (INSTALL_MUSETALK=${INSTALL_MUSETALK:-1}) — LatentSync is the backend in use"
+else
 if [ ! -d "$MUSETALK_DIR" ]; then
   git clone --depth 1 https://github.com/TMElyralab/MuseTalk.git "$MUSETALK_DIR"
 fi
@@ -85,6 +93,7 @@ say "3/6  MuseTalk weights (~10 GB — slowest step)"
 # the 0.x line provides.
 pip install -q "huggingface_hub<1.0" gdown
 python "$WORKER_DIR_SRC/download_weights.py" --dir "$MUSETALK_DIR/models"
+fi   # end of the INSTALL_MUSETALK guard covering steps 2 and 3
 
 say "4/6  Chatterbox TTS — in its OWN venv"
 # Chatterbox and MuseTalk require INCOMPATIBLE torch versions and cannot share
@@ -107,6 +116,10 @@ echo "     chatterbox venv: $("$CB_VENV/bin/python" -c 'import torch;print("torc
 echo "     system python  : $(python -c 'import torch;print("torch",torch.__version__)')"
 
 # Guard: the system torch MUST still match what mmcv was built against.
+# Only meaningful when MuseTalk is actually installed — mmcv's compiled ops are the thing
+# that breaks. With INSTALL_MUSETALK=0 the system torch is just the base image's, and
+# asserting 2.0.x would abort the whole boot (set -e) for no reason.
+if [ "${INSTALL_MUSETALK:-1}" = "1" ]; then
 python - <<'EOF'
 import sys, torch
 if not torch.__version__.startswith("2.0"):
@@ -117,6 +130,9 @@ if not torch.__version__.startswith("2.0"):
     )
 print("     system torch still 2.0.x — mmcv ABI intact")
 EOF
+else
+  echo "     system-torch/mmcv guard skipped (MuseTalk not installed)"
+fi
 
 say "5/7  LatentSync (higher quality lip sync)"
 # LatentSync pins torch 2.5.1 — incompatible with MuseTalk's 2.0.1, so it gets
@@ -213,22 +229,6 @@ if [ ! -f "$WORKER_DIR/run_worker.py" ]; then
 fi
 chmod +x "$WORKER_DIR/watermark.sh"
 
-say "6b/7  EchoMimicV3 (Apache-2.0) — photo -> talking video"
-# Optional, opt-in via INSTALL_ECHOMIMIC=1, and non-fatal: the lip-sync pipeline is what
-# earns money today, so this experiment must never be able to stop the pod from booting.
-# It pulls ~22 GB (the Wan2.1 base alone is 18.5 GB) and refuses to start if the volume
-# cannot hold it, because a half-downloaded weight file looks installed on the next boot.
-if [ "${INSTALL_ECHOMIMIC:-0}" = "1" ]; then
-  if [ -f "$WORKER_DIR/install_echomimic.sh" ]; then
-    WORKER_DIR="$WORKER_DIR" bash "$WORKER_DIR/install_echomimic.sh" \
-      || echo "     !! EchoMimic install failed (non-fatal — continuing to start the worker)"
-  else
-    echo "     !! install_echomimic.sh not in $WORKER_DIR — skipping"
-  fi
-else
-  echo "     skipped (INSTALL_ECHOMIMIC=0)"
-fi
-
 say "7/7  smoke check"
 python - <<'EOF'
 import torch
@@ -253,7 +253,5 @@ exec env \
   LATENTSYNC_DIR="$LS_DIR" \
   LATENTSYNC_PYTHON="$LS_VENV/bin/python" \
   LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-latentsync}" \
-  EM_REPO="${EM_DIR:-/workspace/echomimic_v3}" \
-  EM_PYTHON="${EM_VENV:-/workspace/emvenv}/bin/python" \
   IDLE_EXIT="${IDLE_EXIT:-0}" \
   python run_worker.py

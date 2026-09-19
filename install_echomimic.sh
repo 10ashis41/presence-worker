@@ -18,10 +18,30 @@ EM_MODELS="$EM_DIR/models"
 HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 export HF_HOME HF_HUB_DISABLE_TELEMETRY=1
 
-# Wan2.1-Fun-1.3B-InP is 18.5 GB (10.8 of it the T5 text encoder) and the EchoMimic
-# transformer is 3.3 GB. Running out of space mid-download leaves a half-written file that
-# looks installed on the next boot, so measure first and refuse rather than corrupt.
-NEED_GB="${EM_NEED_GB:-26}"
+# Wan2.1-Fun-1.3B-InP is ~15.5 GB with our allow-patterns (10.8 of it the T5 text encoder;
+# the 2.98 GB base DiT is skipped because we supply EchoMimic's transformer instead), the
+# EchoMimic transformer is 3.3 GB, wav2vec2 is 0.4 GB, and the venv lands around 8 GB with
+# torch + tensorflow + moviepy. Call it 28 GB. Running out mid-download leaves a
+# half-written file that looks installed on the next boot, so measure first and refuse.
+NEED_GB="${EM_NEED_GB:-28}"
+
+# FREE_SPACE=1 removes the two things we know are dead weight before measuring. Explicit
+# and opt-in rather than silent housekeeping: deleting 10 GB of a colleague's model weights
+# inside an "install" script is the kind of thing that should be visible in the log.
+if [ "${FREE_SPACE:-0}" = "1" ]; then
+  echo "     == freeing space (FREE_SPACE=1) =="
+  for d in "${MUSETALK_DIR:-/workspace/MuseTalk}" "${PIP_CACHE_DIR:-/workspace/pip-cache}"; do
+    if [ -e "$d" ]; then
+      sz="$(du -sh "$d" 2>/dev/null | cut -f1)"
+      rm -rf "$d"
+      echo "       removed $d ($sz)"
+    fi
+  done
+  # MuseTalk's weights may also be split into the HF cache; report what is left so the next
+  # shortage is diagnosable from the log instead of by guessing.
+  echo "     == what is using /workspace now =="
+  du -sh /workspace/* 2>/dev/null | sort -rh | head -12 | sed 's/^/       /'
+fi
 
 echo "     == disk =="
 df -h /workspace | sed 's/^/       /'
