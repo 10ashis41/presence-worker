@@ -40,6 +40,14 @@ export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 mkdir -p "$HF_HOME"
 echo "HF_HOME=$HF_HOME"
 
+# pip's cache also defaults to the container disk, which RunPod wipes on every
+# stop/restart — so torch (2.3 GB), mmcv and friends were being re-downloaded on
+# every single boot. That reinstall IS most of the ~10-minute provisioning time.
+# Pointing the cache at the persistent volume turns reinstalls into disk copies.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pip-cache}"
+mkdir -p "$PIP_CACHE_DIR"
+echo "PIP_CACHE_DIR=$PIP_CACHE_DIR"
+
 say "1/6  system packages"
 apt-get update -qq
 apt-get install -y -qq ffmpeg git wget fonts-dejavu-core libgl1 libglib2.0-0 >/dev/null
