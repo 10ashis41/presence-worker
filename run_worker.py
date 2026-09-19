@@ -427,15 +427,111 @@ def beacon():
         log("  beacon failed (non-fatal):", e)
 
 
+# ------------------------------------------------------- sharded tasks
+# One job, several workers. The API hands out `prepare` -> `part` -> `finish`;
+# each part is a self-contained frame range. See the sharding notes in api/server.js
+# for why LatentSync can be split at all (independent 16-frame chunks).
+def task_prepare(t, work: Path):
+    """Run TTS once and pin the narration for every part.
+
+    Parts must NOT each generate their own voice track: the cloned voice is not
+    deterministic run to run, so the seams would be audible as a change of voice.
+    One track, shared by all parts.
+    """
+    jid = t["id"]
+    take = work / ("take." + t.get("ext", "mp4"))
+    download(f"/jobs/{jid}/take", take)
+    narration = work / ("narration.mp3" if TTS_BACKEND == "elevenlabs" else "narration.wav")
+    lang = t.get("language") or detect_language(t["script"])
+    log(f"  prepare: tts={TTS_BACKEND} language={lang}")
+    if TTS_BACKEND == "elevenlabs":
+        tts_elevenlabs(t["script"], narration)
+    else:
+        tts_chatterbox(t["script"], take, narration, work, lang)
+    normalize_narration(narration, os.environ.get("NARRATION_LUFS", "-16"))
+    with open(narration, "rb") as f:
+        call("PUT", f"/jobs/{jid}/narration", raw=f.read(), timeout=1800)
+    log(f"  narration pinned: {probe_duration(narration):.2f}s")
+
+
+def trim_looped_take(take: Path, start_frame: int, frames: int, fps: int, out: Path):
+    """Cut this part's slice from the take, looping it if the take is shorter.
+
+    A take is normally far shorter than the narration, so it has to repeat either
+    way. Here it repeats *continuously forward*, so part k+1 resumes where part k
+    stopped instead of rewinding — that is what keeps a seam from jumping pose.
+    """
+    take_dur = probe_duration(take) or 0
+    off = (start_frame / fps) % take_dur if take_dur > 0 else 0
+    pad = 8 / fps      # slack so LatentSync never has to loop the slice itself
+    dur = frames / fps + pad
+    run(["ffmpeg", "-y", "-loglevel", "error", "-stream_loop", "-1", "-i", str(take),
+         "-ss", f"{off:.6f}", "-t", f"{dur:.6f}", "-r", str(fps), "-an",
+         "-c:v", "libx264", "-crf", "16", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+         str(out)])
+
+
+def task_part(t, work: Path):
+    jid, i = t["id"], int(t["part"])
+    t0, t1 = int(t["startFrame"]), int(t["endFrame"])
+    fps = int(t.get("fps", 25))
+    frames = t1 - t0
+    log(f"  part {i+1}/{t['parts']}: frames {t0}-{t1} ({frames/fps:.1f}s of video)")
+    take = work / ("take." + t.get("ext", "mp4"))
+    download(f"/jobs/{jid}/take", take)
+    narr = work / "narration.wav"
+    download(f"/jobs/{jid}/narration", narr)
+    # sample-accurate slice of the pinned narration
+    part_narr = work / "part_narration.wav"
+    run(["ffmpeg", "-y", "-loglevel", "error",
+         "-ss", f"{t0/fps:.6f}", "-t", f"{frames/fps:.6f}", "-i", str(narr),
+         "-c:a", "pcm_s16le", str(part_narr)])
+    part_take = work / "part_take.mp4"
+    trim_looped_take(take, t0, frames, fps, part_take)
+    out = lipsync_latentsync(part_take, part_narr, work)
+    with open(out, "rb") as f:
+        call("PUT", f"/jobs/{jid}/part/{i}", raw=f.read(), timeout=3600)
+    log(f"  uploaded part {i} ({out.stat().st_size/1e6:.1f} MB)")
+
+
+def task_finish(t, work: Path):
+    """Watermark + matte the assembled file, then close the job out."""
+    jid = t["id"]
+    final = work / "final.mp4"
+    download(f"/jobs/{jid}/assembled", final)
+    log(f"  finish: assembled {final.stat().st_size/1e6:.1f} MB, {probe_duration(final):.1f}s")
+    preview = work / "preview.mp4"
+    run(["bash", str(HERE / "watermark.sh"), str(final), str(preview)])
+    alpha = None
+    if MATTE_BACKEND != "none":
+        call("POST", f"/jobs/{jid}/progress", {"step": 5})
+        try:
+            webm = matte_ben2(final, work)
+            alpha = to_prores_alpha(webm, work) if MATTE_FORMAT == "prores" else webm
+            log(f"  alpha {alpha.stat().st_size/1e6:.1f} MB")
+        except Exception as e:
+            log(f"  matte failed (non-fatal): {type(e).__name__}: {e}")
+    uploads = [("final", final), ("preview", preview)]
+    if alpha:
+        uploads.append(("alpha", alpha))
+    for kind, p in uploads:
+        with open(p, "rb") as f:
+            call("PUT", f"/jobs/{jid}/result/{kind}", raw=f.read(), timeout=3600)
+        log(f"  uploaded {kind}")
+    call("POST", f"/jobs/{jid}/done", {"sharded": True})
+    log(f"  DONE {jid}")
+
+
 def main():
-    log(f"worker up — api={API} tts={TTS_BACKEND} lipsync={LIPSYNC_BACKEND}")
+    log(f"worker up — api={API} tts={TTS_BACKEND} lipsync={LIPSYNC_BACKEND} "
+        f"matte={MATTE_BACKEND}/{MATTE_FORMAT}")
     if LIPSYNC_BACKEND == "passthrough":
         log("  !! passthrough mode: output is NOT a clone. Pipeline testing only.")
     beacon()
     idle = 0
     while True:
         try:
-            job = call("GET", "/work", timeout=60)
+            job = call("GET", "/work?v=2", timeout=60)
         except urllib.error.HTTPError as e:
             log("api error", e.code); time.sleep(POLL); continue
         except Exception as e:
@@ -450,16 +546,40 @@ def main():
             time.sleep(POLL); continue
 
         idle = 0
-        log("claimed", job["id"])
+        task = job.get("task") or "render"
+        log("claimed", job["id"], f"[{task}]" if task != "render" else "")
         work = Path(tempfile.mkdtemp(prefix="presence-"))
         try:
-            render(job, work)
+            if task == "prepare":
+                task_prepare(job, work)
+            elif task == "part":
+                task_part(job, work)
+            elif task == "finish":
+                task_finish(job, work)
+            else:
+                render(job, work)
             ok = True
         except Exception as e:
             log("FAILED:", repr(e))
             ok = False
-            try: call("POST", f"/jobs/{job['id']}/done", {"error": str(e)[:300]})
-            except Exception: pass
+            # A failed *part* must not sink the job: release it so another worker
+            # picks it up, and leave the reason visible on the job. Only a failed
+            # whole-job render or finish marks the job itself as failed.
+            if task == "part":
+                try:
+                    call("POST", f"/jobs/{job['id']}/part/{job.get('part')}/fail",
+                         {"error": str(e)[:300]})
+                except Exception:
+                    pass
+            elif task == "prepare":
+                try:
+                    call("POST", f"/jobs/{job['id']}/narration/fail",
+                         {"error": str(e)[:300]})
+                except Exception:
+                    pass
+            else:
+                try: call("POST", f"/jobs/{job['id']}/done", {"error": str(e)[:300]})
+                except Exception: pass
         finally:
             shutil.rmtree(work, ignore_errors=True)
         if ONESHOT:
