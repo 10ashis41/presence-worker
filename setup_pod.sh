@@ -190,6 +190,6 @@ exec env \
   HF_HOME="$HF_HOME" \
   LATENTSYNC_DIR="$LS_DIR" \
   LATENTSYNC_PYTHON="$LS_VENV/bin/python" \
-  LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-musetalk}" \
+  LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-latentsync}" \
   IDLE_EXIT="${IDLE_EXIT:-0}" \
   python run_worker.py

@@ -8,8 +8,8 @@ Two stages are pluggable so the same worker runs with or without a GPU:
   TTS_BACKEND      chatterbox  GPU, free, clones the presenter's own voice   [production]
                    elevenlabs  API, works anywhere, costs per character      [no-GPU fallback]
 
-  LIPSYNC_BACKEND  musetalk    GPU, fast, 256px — jitters/"melts"            [speed]
-                   latentsync  GPU, slow, 512px + temporal layers            [quality]
+  LIPSYNC_BACKEND  latentsync  GPU, 512px + temporal layers                  [DEFAULT]
+                   musetalk    GPU, 256px — visibly "melts", rejected        [speed only]
                    passthrough ffmpeg only — muxes narration over the take   [PIPELINE TEST ONLY]
 
 `passthrough` exists so the whole system (API, queueing, watermarking, upload,
@@ -24,7 +24,7 @@ Env:
     API_BASE        https://api.aiguyonthefly.com/presenter
     WORKER_TOKEN    bearer token from the API's .env
     TTS_BACKEND     chatterbox | elevenlabs          (default chatterbox)
-    LIPSYNC_BACKEND musetalk | latentsync | passthrough  (default musetalk)
+    LIPSYNC_BACKEND latentsync | musetalk | passthrough  (default latentsync)
     ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID         (elevenlabs backend only)
     MUSETALK_DIR    /opt/MuseTalk                    (musetalk backend only)
     POLL_SECONDS    idle poll interval               (default 20)
@@ -42,7 +42,7 @@ POLL = int(os.environ.get("POLL_SECONDS", "20"))
 IDLE_EXIT = int(os.environ.get("IDLE_EXIT", "0"))
 ONESHOT = os.environ.get("ONESHOT") == "1"
 TTS_BACKEND = os.environ.get("TTS_BACKEND", "chatterbox")
-LIPSYNC_BACKEND = os.environ.get("LIPSYNC_BACKEND", "musetalk")
+LIPSYNC_BACKEND = os.environ.get("LIPSYNC_BACKEND", "latentsync")
 HERE = Path(__file__).parent
 
 
