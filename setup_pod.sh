@@ -34,6 +34,12 @@ if [ "$PYV" != "3.10" ]; then
 fi
 echo "python $PYV — ok"
 
+# Keep HuggingFace's cache on the persistent volume — otherwise every pod
+# restart re-downloads Chatterbox's models (~4.5 min observed).
+export HF_HOME="${HF_HOME:-/workspace/hf-cache}"
+mkdir -p "$HF_HOME"
+echo "HF_HOME=$HF_HOME"
+
 say "1/6  system packages"
 apt-get update -qq
 apt-get install -y -qq ffmpeg git wget fonts-dejavu-core >/dev/null
@@ -64,7 +70,12 @@ say "3/6  MuseTalk weights (~10 GB — slowest step)"
 # removed `gdown --id`, a China mirror, and NO exit-code checks — it prints
 # success while downloading nothing). Verified failing 2026-09-19. We use our
 # own downloader, which verifies each file and exits non-zero on any miss.
-pip install -q -U "huggingface_hub" gdown
+# Pin huggingface_hub<1.0: `-U` pulls 1.x, which breaks transformers 4.39.2
+# that MuseTalk imports —
+#   ImportError: huggingface-hub>=0.19.3,<1.0 is required ... found 1.32.0
+# (observed on a real pod, 2026-09-19). We only need hf_hub_download, which
+# the 0.x line provides.
+pip install -q "huggingface_hub<1.0" gdown
 python "$WORKER_DIR_SRC/download_weights.py" --dir "$MUSETALK_DIR/models"
 
 say "4/6  Chatterbox TTS — in its OWN venv"
@@ -128,6 +139,7 @@ exec env \
   MUSETALK_DIR="$MUSETALK_DIR" \
   TTS_BACKEND="${TTS_BACKEND:-chatterbox}" \
   CHATTERBOX_PYTHON="${CB_VENV:-/workspace/cbvenv}/bin/python" \
+  HF_HOME="$HF_HOME" \
   LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-musetalk}" \
   IDLE_EXIT="${IDLE_EXIT:-0}" \
   python run_worker.py
