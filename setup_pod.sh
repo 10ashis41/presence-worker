@@ -21,6 +21,7 @@ set -euo pipefail
 API_BASE="${API_BASE:-https://api.aiguyonthefly.com/presenter}"
 MUSETALK_DIR="${MUSETALK_DIR:-/workspace/MuseTalk}"
 WORKER_DIR="${WORKER_DIR:-/workspace/presence-worker}"
+WORKER_DIR_SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 say(){ printf "\n\033[1;32m==> %s\033[0m\n" "$1"; }
 
@@ -59,14 +60,23 @@ mim install -q "mmdet==3.1.0"
 mim install -q "mmpose==1.1.0"
 
 say "3/6  MuseTalk weights (~10 GB — slowest step)"
-if [ ! -f "$MUSETALK_DIR/models/musetalkV15/unet.pth" ]; then
-  sh ./download_weights.sh
-else
-  echo "     already present, skipping"
-fi
+# MuseTalk's own download_weights.sh is broken (deprecated huggingface-cli,
+# removed `gdown --id`, a China mirror, and NO exit-code checks — it prints
+# success while downloading nothing). Verified failing 2026-09-19. We use our
+# own downloader, which verifies each file and exits non-zero on any miss.
+pip install -q -U "huggingface_hub" gdown
+python "$WORKER_DIR_SRC/download_weights.py" --dir "$MUSETALK_DIR/models"
 
 say "4/6  Chatterbox TTS (multilingual: en / he / ar)"
+# NOTE: chatterbox-tts depends on a much newer torch and WILL upgrade the
+# 2.0.1 pin installed above (observed: 2.0.1 -> 2.6.0 on a real pod). Chatterbox
+# works fine on the newer torch; MuseTalk's mmlab stack is the fragile one.
+# Install it, then report what torch actually survived so the log tells the truth.
 pip install -q chatterbox-tts
+python - <<'EOF'
+import torch, torchvision
+print(f"     after chatterbox: torch {torch.__version__}, torchvision {torchvision.__version__}")
+EOF
 
 say "5/6  worker files"
 mkdir -p "$WORKER_DIR"
