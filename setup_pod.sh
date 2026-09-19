@@ -213,6 +213,22 @@ if [ ! -f "$WORKER_DIR/run_worker.py" ]; then
 fi
 chmod +x "$WORKER_DIR/watermark.sh"
 
+say "6b/7  EchoMimicV3 (Apache-2.0) — photo -> talking video"
+# Optional, opt-in via INSTALL_ECHOMIMIC=1, and non-fatal: the lip-sync pipeline is what
+# earns money today, so this experiment must never be able to stop the pod from booting.
+# It pulls ~22 GB (the Wan2.1 base alone is 18.5 GB) and refuses to start if the volume
+# cannot hold it, because a half-downloaded weight file looks installed on the next boot.
+if [ "${INSTALL_ECHOMIMIC:-0}" = "1" ]; then
+  if [ -f "$WORKER_DIR/install_echomimic.sh" ]; then
+    WORKER_DIR="$WORKER_DIR" bash "$WORKER_DIR/install_echomimic.sh" \
+      || echo "     !! EchoMimic install failed (non-fatal — continuing to start the worker)"
+  else
+    echo "     !! install_echomimic.sh not in $WORKER_DIR — skipping"
+  fi
+else
+  echo "     skipped (INSTALL_ECHOMIMIC=0)"
+fi
+
 say "7/7  smoke check"
 python - <<'EOF'
 import torch
