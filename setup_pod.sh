@@ -42,7 +42,7 @@ echo "HF_HOME=$HF_HOME"
 
 say "1/6  system packages"
 apt-get update -qq
-apt-get install -y -qq ffmpeg git wget fonts-dejavu-core >/dev/null
+apt-get install -y -qq ffmpeg git wget fonts-dejavu-core libgl1 libglib2.0-0 >/dev/null
 
 say "2/6  MuseTalk"
 if [ ! -d "$MUSETALK_DIR" ]; then
@@ -110,7 +110,55 @@ if not torch.__version__.startswith("2.0"):
 print("     system torch still 2.0.x — mmcv ABI intact")
 EOF
 
-say "5/6  worker files"
+say "5/7  LatentSync (higher quality lip sync)"
+# LatentSync pins torch 2.5.1 — incompatible with MuseTalk's 2.0.1, so it gets
+# its own venv too. It runs at 512px (vs MuseTalk's 256) and has temporal
+# layers + TREPA, which is what fixes MuseTalk's frame-to-frame "melting".
+# Apache-2.0. VRAM: 8GB for v1.5, 18GB for v1.6.
+LS_DIR="${LS_DIR:-/workspace/LatentSync}"
+LS_VENV="${LS_VENV:-/workspace/lsvenv}"
+if [ "${INSTALL_LATENTSYNC:-1}" = "1" ]; then
+  if [ ! -d "$LS_DIR/.git" ]; then
+    git clone --depth 1 https://github.com/bytedance/LatentSync.git "$LS_DIR"
+  fi
+  if [ ! -x "$LS_VENV/bin/python" ]; then
+    python -m venv "$LS_VENV"
+  fi
+  "$LS_VENV/bin/pip" install -q --upgrade pip
+  "$LS_VENV/bin/pip" install -q -r "$LS_DIR/requirements.txt"
+
+  mkdir -p "$LS_DIR/checkpoints/whisper"
+  "$LS_VENV/bin/python" - <<EOF
+import os
+from pathlib import Path
+from huggingface_hub import hf_hub_download
+root = Path("$LS_DIR/checkpoints")
+want = [("whisper/tiny.pt", "whisper/tiny.pt", 30), ("latentsync_unet.pt", "latentsync_unet.pt", 1000)]
+missing = []
+for remote, local, min_mb in want:
+    dest = root / local
+    have = dest.stat().st_size/1048576 if dest.exists() else 0
+    if have >= min_mb:
+        print(f"     have {local} ({have:.0f} MB)"); continue
+    print(f"     get  {remote}")
+    try:
+        got = hf_hub_download(repo_id="ByteDance/LatentSync-1.6", filename=remote)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(Path(got).read_bytes())
+    except Exception as e:
+        missing.append(f"{remote}: {e}"); continue
+    sz = dest.stat().st_size/1048576
+    if sz < min_mb: missing.append(f"{local} too small ({sz:.0f} MB)")
+if missing:
+    raise SystemExit("LatentSync weights failed:\n  " + "\n  ".join(missing))
+print("     latentsync weights ok")
+EOF
+  echo "     latentsync venv: $("$LS_VENV/bin/python" -c 'import torch;print("torch",torch.__version__)')"
+else
+  echo "     skipped (INSTALL_LATENTSYNC=0)"
+fi
+
+say "6/7  worker files"
 mkdir -p "$WORKER_DIR"
 if [ ! -f "$WORKER_DIR/run_worker.py" ]; then
   echo "     !! Copy run_worker.py, tts_chatterbox.py and watermark.sh into $WORKER_DIR"
@@ -119,7 +167,7 @@ if [ ! -f "$WORKER_DIR/run_worker.py" ]; then
 fi
 chmod +x "$WORKER_DIR/watermark.sh"
 
-say "6/6  smoke check"
+say "7/7  smoke check"
 python - <<'EOF'
 import torch
 print(f"     torch {torch.__version__}  cuda={torch.cuda.is_available()}")
@@ -140,6 +188,8 @@ exec env \
   TTS_BACKEND="${TTS_BACKEND:-chatterbox}" \
   CHATTERBOX_PYTHON="${CB_VENV:-/workspace/cbvenv}/bin/python" \
   HF_HOME="$HF_HOME" \
+  LATENTSYNC_DIR="$LS_DIR" \
+  LATENTSYNC_PYTHON="$LS_VENV/bin/python" \
   LIPSYNC_BACKEND="${LIPSYNC_BACKEND:-musetalk}" \
   IDLE_EXIT="${IDLE_EXIT:-0}" \
   python run_worker.py

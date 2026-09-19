@@ -8,7 +8,8 @@ Two stages are pluggable so the same worker runs with or without a GPU:
   TTS_BACKEND      chatterbox  GPU, free, clones the presenter's own voice   [production]
                    elevenlabs  API, works anywhere, costs per character      [no-GPU fallback]
 
-  LIPSYNC_BACKEND  musetalk    GPU, real lip sync                            [production]
+  LIPSYNC_BACKEND  musetalk    GPU, fast, 256px — jitters/"melts"            [speed]
+                   latentsync  GPU, slow, 512px + temporal layers            [quality]
                    passthrough ffmpeg only — muxes narration over the take   [PIPELINE TEST ONLY]
 
 `passthrough` exists so the whole system (API, queueing, watermarking, upload,
@@ -23,7 +24,7 @@ Env:
     API_BASE        https://api.aiguyonthefly.com/presenter
     WORKER_TOKEN    bearer token from the API's .env
     TTS_BACKEND     chatterbox | elevenlabs          (default chatterbox)
-    LIPSYNC_BACKEND musetalk | passthrough           (default musetalk)
+    LIPSYNC_BACKEND musetalk | latentsync | passthrough  (default musetalk)
     ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID         (elevenlabs backend only)
     MUSETALK_DIR    /opt/MuseTalk                    (musetalk backend only)
     POLL_SECONDS    idle poll interval               (default 20)
@@ -166,6 +167,39 @@ def lipsync_musetalk(take: Path, narration: Path, work: Path) -> Path:
     return produced[-1]
 
 
+def lipsync_latentsync(take: Path, narration: Path, work: Path) -> Path:
+    """LatentSync 1.6 (ByteDance, Apache-2.0) — the quality option.
+
+    Runs at 512px vs MuseTalk's 256, and its temporal layers + TREPA are what
+    fix MuseTalk's frame-to-frame "melting". Much slower in exchange.
+
+    Lives in its own venv: it pins torch 2.5.1 against MuseTalk's 2.0.1.
+    Args verified against upstream inference.sh, 2026-09-19.
+    """
+    ls_dir = Path(os.environ.get("LATENTSYNC_DIR", "/workspace/LatentSync"))
+    py = os.environ.get("LATENTSYNC_PYTHON", sys.executable)
+    ckpt = ls_dir / "checkpoints" / "latentsync_unet.pt"
+    if not ckpt.exists():
+        raise RuntimeError(f"LatentSync checkpoint missing: {ckpt}")
+
+    out = work / "latentsync_out.mp4"
+    steps = os.environ.get("LATENTSYNC_STEPS", "20")        # 20-50, higher = better + slower
+    guidance = os.environ.get("LATENTSYNC_GUIDANCE", "1.5")  # 1.0-3.0, higher = tighter sync, more jitter
+    run([py, "-m", "scripts.inference",
+         "--unet_config_path", str(ls_dir / "configs/unet/stage2_512.yaml"),
+         "--inference_ckpt_path", str(ckpt),
+         "--inference_steps", steps,
+         "--guidance_scale", guidance,
+         "--enable_deepcache",
+         "--video_path", str(take.resolve()),
+         "--audio_path", str(narration.resolve()),
+         "--video_out_path", str(out)],
+        cwd=str(ls_dir))
+    if not out.exists():
+        raise RuntimeError("LatentSync produced no output file")
+    return out
+
+
 def lipsync_passthrough(take: Path, narration: Path, work: Path) -> Path:
     """No lip sync. Loops the take to cover the narration and burns in a label
     so this can never be mistaken for a finished clone."""
@@ -205,8 +239,12 @@ def render(job, work: Path):
     # 2. lip sync
     call("POST", f"/jobs/{jid}/progress", {"step": 3})
     log(f"  lipsync: {LIPSYNC_BACKEND}")
-    produced = (lipsync_musetalk if LIPSYNC_BACKEND == "musetalk" else lipsync_passthrough)(
-        take, narration, work)
+    backends = {"musetalk": lipsync_musetalk,
+                "latentsync": lipsync_latentsync,
+                "passthrough": lipsync_passthrough}
+    if LIPSYNC_BACKEND not in backends:
+        raise RuntimeError(f"unknown LIPSYNC_BACKEND: {LIPSYNC_BACKEND}")
+    produced = backends[LIPSYNC_BACKEND](take, narration, work)
     final = work / "final.mp4"
     shutil.move(str(produced), final)
     log(f"  final {final.stat().st_size/1e6:.1f} MB, {probe_duration(final):.1f}s")
