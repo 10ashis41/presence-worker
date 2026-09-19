@@ -27,6 +27,17 @@ Env:
     LIPSYNC_BACKEND latentsync | musetalk | passthrough  (default latentsync)
     ELEVENLABS_API_KEY / ELEVENLABS_VOICE_ID         (elevenlabs backend only)
     MUSETALK_DIR    /opt/MuseTalk                    (musetalk backend only)
+    NARRATION_LUFS  loudness target for the narration BEFORE lip sync, in LUFS.
+                    The mouth shapes are generated from this audio, so a quiet
+                    track starves the model of signal — and it fails worst at
+                    lip closures (m/b/p), where the mouth blotches. 0/off keeps
+                    the raw TTS level.                        (default -16)
+    LATENTSYNC_STEPS      20-50, higher = finer detail + slower   (default 20)
+    LATENTSYNC_GUIDANCE   1.0-3.0, higher = tighter sync, more jitter (1.5)
+    LATENTSYNC_SEED       pins the sampling seed so A/B tests compare the
+                          settings and not luck                     (1247)
+    LATENTSYNC_DEEPCACHE  1 = fast but an approximation that can smear
+                          high-frequency mouth detail; 0 = quality pass (1)
     POLL_SECONDS    idle poll interval               (default 20)
     IDLE_EXIT       exit after N idle seconds so a rented pod can shut itself
                     down instead of billing you to sit idle (0 = never)
@@ -129,6 +140,30 @@ def tts_chatterbox(script: str, reference: Path, out: Path, work: Path, lang: st
          "--out", str(out), "--language", lang])
 
 
+def normalize_narration(src: Path, lufs: str) -> None:
+    """Loudness-normalise the narration in place (single-pass loudnorm).
+
+    This is NOT cosmetic. The lip-sync model derives mouth shapes from this
+    audio, and a quiet track gives its audio encoder weak features. That fails
+    hardest exactly where it matters: at lip closures (m/b/p), the model has
+    the least information to work with, and the mouth collapses into a blotch.
+
+    Measured on the first LatentSync render: mean -27.9 dB, peak -9.0 dB — quiet
+    for speech and ~10 dB below a normal delivery. Set NARRATION_LUFS=0 (or
+    "off") to disable and keep the raw TTS level.
+    """
+    if lufs in ("", "0", "off", "none"):
+        return
+    out = src.with_name("narration_norm" + src.suffix)
+    acodec = ["-c:a", "pcm_s16le"] if src.suffix.lower() == ".wav" else \
+             ["-c:a", "libmp3lame", "-b:a", "192k"]
+    run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
+         "-af", f"loudnorm=I={lufs}:TP=-1.5:LRA=11",
+         "-vn", *acodec, str(out)])
+    shutil.move(str(out), str(src))
+    log(f"  narration normalised to {lufs} LUFS")
+
+
 # ------------------------------------------------------------ lip sync
 def lipsync_musetalk(take: Path, narration: Path, work: Path) -> Path:
     """MuseTalk 1.5 does NOT accept --video_path/--audio_path. It reads a YAML
@@ -185,16 +220,27 @@ def lipsync_latentsync(take: Path, narration: Path, work: Path) -> Path:
     out = work / "latentsync_out.mp4"
     steps = os.environ.get("LATENTSYNC_STEPS", "20")        # 20-50, higher = better + slower
     guidance = os.environ.get("LATENTSYNC_GUIDANCE", "1.5")  # 1.0-3.0, higher = tighter sync, more jitter
-    run([py, "-m", "scripts.inference",
-         "--unet_config_path", str(ls_dir / "configs/unet/stage2_512.yaml"),
-         "--inference_ckpt_path", str(ckpt),
-         "--inference_steps", steps,
-         "--guidance_scale", guidance,
-         "--enable_deepcache",
-         "--video_path", str(take.resolve()),
-         "--audio_path", str(narration.resolve()),
-         "--video_out_path", str(out)],
-        cwd=str(ls_dir))
+    # Pin the seed so an A/B between settings compares the settings, not luck,
+    # and so a good render can be reproduced. 1247 is LatentSync's own default.
+    seed = os.environ.get("LATENTSYNC_SEED", "1247")
+    # DeepCache caches UNet features to go faster. It is an APPROXIMATION, and
+    # it lands on exactly the high-frequency detail we care about — lips and
+    # teeth. Default keeps today's behaviour (on); set LATENTSYNC_DEEPCACHE=0
+    # for a quality pass. It is the cheapest A/B against mouth blotching.
+    deepcache = os.environ.get("LATENTSYNC_DEEPCACHE", "1") not in ("0", "false", "off", "")
+    args = [py, "-m", "scripts.inference",
+            "--unet_config_path", str(ls_dir / "configs/unet/stage2_512.yaml"),
+            "--inference_ckpt_path", str(ckpt),
+            "--inference_steps", steps,
+            "--guidance_scale", guidance,
+            "--seed", seed]
+    if deepcache:
+        args.append("--enable_deepcache")
+    args += ["--video_path", str(take.resolve()),
+             "--audio_path", str(narration.resolve()),
+             "--video_out_path", str(out)]
+    log(f"  latentsync: steps={steps} guidance={guidance} seed={seed} deepcache={deepcache}")
+    run(args, cwd=str(ls_dir))
     if not out.exists():
         raise RuntimeError("LatentSync produced no output file")
     return out
@@ -234,6 +280,10 @@ def render(job, work: Path):
         tts_elevenlabs(job["script"], narration)
     else:
         tts_chatterbox(job["script"], take, narration, work, lang)
+    # Loudness-normalise before lip sync: the mouth shapes are generated from
+    # THIS audio, and a quiet track starves the sync model of signal — worst at
+    # lip closures, where it has the least to work with. NARRATION_LUFS=0 skips.
+    normalize_narration(narration, os.environ.get("NARRATION_LUFS", "-16"))
     log(f"  narration {probe_duration(narration):.1f}s")
 
     # 2. lip sync
