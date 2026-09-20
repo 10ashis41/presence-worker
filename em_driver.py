@@ -116,6 +116,13 @@ def main() -> int:
 
     env = dict(os.environ)
     env.update({
+        # retina-face (EchoMimic's face detector) does `from tensorflow.keras.models import
+        # Model`. That module was removed in TF 2.16 when Keras 3 became the default, and
+        # retina-face only pins `tensorflow>=1.9.0` so the resolver is free to install it.
+        # tf-keras (installed by install_echomimic.sh) provides the Keras 2 API and this flag
+        # is what makes `tensorflow.keras` resolve to it. Set here rather than only at install
+        # time so it holds even on a venv someone built by hand.
+        "TF_USE_LEGACY_KERAS": "1",
         "EM_BASE_DIR": str(work), "EM_NAME": name, "EM_SAVE": str(out_dir),
         "EM_MODEL": str(REPO / "models/Wan2.1-Fun-V1.1-1.3B-InP"),
         "EM_TRANSFORMER": str(REPO / "models/transformer/diffusion_pytorch_model.safetensors"),

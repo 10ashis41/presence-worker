@@ -89,6 +89,28 @@ ensure_venv() {
   "$EM_VENV/bin/pip" install -q torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
     --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -2 | sed 's/^/       /'
   "$EM_VENV/bin/python" -c "import torch, torchaudio; print('       emvenv torch', torch.__version__, '| torchaudio', torchaudio.__version__)"
+
+  # SAME BUG CLASS AS THE TORCH RE-PIN ABOVE, different package (found 2026-09-20).
+  # EchoMimic's face detector is retina-face, which declares only `tensorflow>=1.9.0`, so
+  # pip happily installs TF 2.16+ over the 2.15 requirements.txt asked for. In 2.16 Keras 3
+  # became the default and the `tensorflow.keras` module was removed, so the driver dies at
+  # import — 4 minutes of TTS work already spent:
+  #   src/face_detect.py -> retinaface -> ModuleNotFoundError: No module named 'tensorflow.keras'
+  # tf-keras restores the Keras 2 API, and TF_USE_LEGACY_KERAS=1 (set in em_driver.py, so it
+  # holds no matter how this venv was built) routes `tensorflow.keras` back to it. Installing
+  # tf-keras is harmless on TF 2.15, so this is safe whichever version the resolver picks.
+  echo "     == tf-keras (retina-face imports tensorflow.keras, removed in TF 2.16) =="
+  "$EM_VENV/bin/pip" install -q tf-keras 2>&1 | tail -2 | sed 's/^/       /'
+  TF_USE_LEGACY_KERAS=1 "$EM_VENV/bin/python" - <<'PY' 2>&1 | sed 's/^/       /'
+import os
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Model  # the exact import retina-face makes
+    print(f"emvenv tensorflow {tf.__version__} | tensorflow.keras import OK")
+except Exception as e:
+    print(f"!! tensorflow.keras still broken: {type(e).__name__}: {e}")
+PY
 }
 
 download_weights() {
