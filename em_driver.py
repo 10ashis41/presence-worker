@@ -43,24 +43,50 @@ ANCHOR = 'self.save_path = "outputs"'
 # while no GPU has been initialised yet.
 FACE_ANCHOR = "from src.face_detect import get_mask_coord"
 
-TF_CPU_SHIM = """# ---- injected by em_driver.py: keep TensorFlow on the CPU ----
+TF_CPU_SHIM = '''# ---- injected by em_driver.py: keep TensorFlow on the CPU ----
 # retina-face runs on TensorFlow, and TF's cuDNN does not match this container's CUDA 11.8 /
 # driver 570.x. The moment it touches the GPU it dies with:
 #     INTERNAL: No DNN support for stream [[{{node model/bn_data/FusedBatchNormV3}}]]
-# — after the Wan transformer has already loaded, so ~3.5 minutes in.
 #
 # Face detection is ONE forward pass over ONE still image; on CPU that costs a second or two.
-# The video diffusion that actually needs the GPU is PyTorch and is untouched by this.
+# The video diffusion that actually needs the GPU is PyTorch and must be left alone.
 #
-# This must NOT be done with CUDA_VISIBLE_DEVICES: that variable would blind torch as well
-# and move the entire render onto the CPU.
-import tensorflow as _tf
+# CUDA_VISIBLE_DEVICES IS SET ONLY ACROSS THE TENSORFLOW IMPORT, THEN RESTORED.
+# Calling tf.config.set_visible_devices() after a plain `import tensorflow` was not enough:
+# TF still loaded its own cuDNN into the process, and torch's first conv3d in the VAE then
+# died with `cuDNN error: CUDNN_STATUS_NOT_INITIALIZED`. Hiding the GPU from TF *during the
+# import* means TF never loads a CUDA library at all. The variable is restored immediately,
+# before torch initialises CUDA, so the render still runs on the GPU.
+import os as _os
+_prev_cvd = _os.environ.get("CUDA_VISIBLE_DEVICES")
+_os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 try:
-    _tf.config.set_visible_devices([], "GPU")
-    print("     em: TensorFlow pinned to CPU (retina-face only)", flush=True)
-except Exception as _e:  # already initialised, or no GPU to hide — harmless either way
-    print(f"     em: could not pin TensorFlow to CPU ({_e})", flush=True)
-"""
+    import tensorflow as _tf
+    try:
+        _tf.config.set_visible_devices([], "GPU")
+    except Exception:
+        pass
+    print("     em: TensorFlow imported with no GPU visible (retina-face runs on CPU)", flush=True)
+finally:
+    if _prev_cvd is None:
+        _os.environ.pop("CUDA_VISIBLE_DEVICES", None)
+    else:
+        _os.environ["CUDA_VISIBLE_DEVICES"] = _prev_cvd
+
+# Instrumentation: CUDNN_STATUS_NOT_INITIALIZED is also what a VRAM-starved cuDNN handle
+# looks like, so record what is actually free before the model loads. If this line reports
+# plenty of headroom, the cause was the library clash above and not memory.
+try:
+    import torch as _torch
+    if _torch.cuda.is_available():
+        _free, _total = _torch.cuda.mem_get_info()
+        print(f"     em: VRAM {_free/2**30:.1f} GiB free of {_total/2**30:.1f} GiB "
+              f"(torch sees {_torch.cuda.device_count()} device(s))", flush=True)
+    else:
+        print("     em: !! torch reports NO CUDA — the shim leaked CUDA_VISIBLE_DEVICES", flush=True)
+except Exception as _e:
+    print(f"     em: VRAM probe failed ({_e})", flush=True)
+'''
 
 OVERRIDES = """
         # ---- injected by em_driver.py ----
