@@ -78,6 +78,17 @@ ensure_venv() {
     --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -3 | sed 's/^/       /'
   echo "     == requirements (tensorflow 2.15 + moviepy — the slow part) =="
   "$EM_VENV/bin/pip" install -q -r "$EM_DIR/requirements.txt" 2>&1 | tail -5 | sed 's/^/       /'
+  # RE-PIN TORCH LAST. requirements.txt only wants torch>=2.1.2, so its resolver installs a
+  # much newer build on top of the cu124 trio above (observed: torch 2.14.0+cu130 while
+  # torchaudio stayed 2.5.1+cu124). The mismatch is invisible until the driver imports, and
+  # then it is fatal:
+  #   OSError: libtorchaudio.so: undefined symbol: _ZNK5torch8autograd4Node4nameEv
+  #   -> "EchoMimic driver exited 1" AFTER 4 minutes of TTS work. EchoMimic is tested on
+  # 2.5.1, so the pinned trio is restored as the final word.
+  echo "     == re-pinning torch 2.5.1 (requirements.txt installs a newer, incompatible one) =="
+  "$EM_VENV/bin/pip" install -q torch==2.5.1 torchvision==0.20.1 torchaudio==2.5.1 \
+    --index-url https://download.pytorch.org/whl/cu124 2>&1 | tail -2 | sed 's/^/       /'
+  "$EM_VENV/bin/python" -c "import torch, torchaudio; print('       emvenv torch', torch.__version__, '| torchaudio', torchaudio.__version__)"
 }
 
 download_weights() {
