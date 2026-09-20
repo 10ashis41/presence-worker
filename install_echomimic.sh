@@ -28,7 +28,11 @@ EM_DIR="${EM_DIR:-/workspace/echomimic_v3}"
 EM_VENV="${EM_VENV:-/opt/emvenv}"
 EM_MODELS="$EM_DIR/models"
 HF_HOME="${HF_HOME:-/workspace/hf-cache}"
-export HF_HOME HF_HUB_DISABLE_TELEMETRY=1
+# EM_MODELS must be EXPORTED: the weights downloader below is a separate `python` child
+# (heredoc) that reads it via os.environ, and a shell variable set but not exported reaches
+# no child at all — the download then dies with KeyError: 'EM_MODELS' and the install
+# silently reports "weights failed (non-fatal)", leaving the photo path dead.
+export HF_HOME HF_HUB_DISABLE_TELEMETRY=1 EM_MODELS EM_VENV EM_DIR
 
 # Only the weights must fit on the volume now: ~19 GB. Measured on a freshly provisioned
 # 50 GB volume: ~20 GB free after LatentSync, both venvs and the HF cache exist. The venv
