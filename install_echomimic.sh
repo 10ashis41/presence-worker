@@ -38,7 +38,7 @@ export HF_HOME HF_HUB_DISABLE_TELEMETRY=1 EM_MODELS EM_VENV EM_DIR
 # 50 GB volume: ~20 GB free after LatentSync, both venvs and the HF cache exist. The venv
 # (~7 GB) lives on the container disk and the pip cache no longer sits on the volume — those
 # two moves are what create the room.
-NEED_GB="${EM_NEED_GB:-20}"
+NEED_GB="${EM_NEED_GB:-23}"
 
 echo "     == disk =="
 df -h /workspace / 2>/dev/null | sed 's/^/       /'
@@ -120,12 +120,21 @@ import os
 from huggingface_hub import snapshot_download
 base = os.environ["EM_MODELS"]
 jobs = [
-    # Wan 2.1 Fun 1.3B inpainting base: VAE, umt5-xxl text encoder, CLIP image encoder.
-    # The 2.98 GB base DiT is deliberately NOT requested — we supply EchoMimic's
-    # transformer instead (see transformer_path in em_driver.py).
+    # Wan 2.1 Fun 1.3B inpainting base: VAE, umt5-xxl text encoder, CLIP image encoder,
+    # AND the 2.98 GB base DiT (diffusion_pytorch_model.safetensors).
+    #
+    # The DiT was deliberately skipped here until 2026-09-20 on the theory that EchoMimic's
+    # own transformer replaces it. It does not — it is loaded ON TOP of this one. Upstream
+    # does `WanTransformerAudioMask3DModel.from_pretrained(<this dir>)` first and immediately
+    # compares shapes:
+    #     if model.state_dict()['patch_embedding.weight'].size() != state_dict[...].size()
+    # With the DiT absent that state_dict is empty and inference dies with
+    #     KeyError: 'patch_embedding.weight'
+    # — after TTS has already run. Note the allow_patterns below had no "*.safetensors", so
+    # the omission was silent: the directory existed and looked populated.
     ("alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", f"{base}/Wan2.1-Fun-V1.1-1.3B-InP",
-     ["*.pth", "*.json", "*.model", "*.txt", "*/tokenizer.json",
-      "*/special_tokens_map.json", "*/tokenizer_config.json",
+     ["*.pth", "*.json", "*.model", "*.txt", "diffusion_pytorch_model.safetensors",
+      "*/tokenizer.json", "*/special_tokens_map.json", "*/tokenizer_config.json",
       "*/sentencepiece.bpe.model", "*/spiece.model"]),
     # EchoMimic's own transformer. Preview, not flash-pro: flash-pro's audio encoder is a
     # Chinese wav2vec2 and our narration is English.
@@ -169,9 +178,14 @@ fi
 # The weights check comes first and on its own, so the common restart case (weights on the
 # volume, container disk wiped) is a fast no-op rather than a 19 GB re-verification. The
 # space check is before the venv build so a doomed run fails in seconds, not minutes.
+# The Wan check tests for the BASE DiT FILE, not just the directory. Testing the directory
+# is what let the missing 2.98 GB DiT survive every restart: the dir existed (VAE, T5, CLIP
+# were all there), the guard passed, the download was skipped, and the failure only showed up
+# mid-render as KeyError: 'patch_embedding.weight'. A guard must check the thing that breaks.
 if [ -f "$EM_MODELS/transformer/diffusion_pytorch_model.safetensors" ] \
    && [ -f "$EM_MODELS/wav2vec2-base-960h/config.json" ] \
-   && [ -d "$EM_MODELS/Wan2.1-Fun-V1.1-1.3B-InP" ]; then
+   && [ -f "$EM_MODELS/Wan2.1-Fun-V1.1-1.3B-InP/diffusion_pytorch_model.safetensors" ] \
+   && [ -f "$EM_MODELS/Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth" ]; then
   echo "     weights already on the volume — skipping download"
 else
   if [ "${free_gb:-0}" -lt "$NEED_GB" ]; then
