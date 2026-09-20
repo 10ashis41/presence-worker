@@ -96,7 +96,15 @@ jobs = [
       "*/sentencepiece.bpe.model", "*/spiece.model"]),
     # EchoMimic's own transformer. Preview, not flash-pro: flash-pro's audio encoder is a
     # Chinese wav2vec2 and our narration is English.
-    ("BadToBest/EchoMimicV3", f"{base}/transformer",
+    #
+    # local_dir is the MODELS ROOT and the allow_patterns keep the repo's own `transformer/`
+    # prefix, so the files land at models/transformer/<file> — which is where em_driver.py
+    # looks (EM_TRANSFORMER) and what the "already downloaded" check above tests for.
+    # local_dir=$base/transformer ALSO strips the prefix target-wise but keeps it in the
+    # pattern, which wrote models/transformer/transformer/diffusion_pytorch_model.safetensors:
+    # the 3.4 GB downloaded on every boot, the check never saw it, and the install then died
+    # on the free-space guard claiming the weights were missing.
+    ("BadToBest/EchoMimicV3", base,
      ["transformer/config.json", "transformer/diffusion_pytorch_model.safetensors"]),
     ("facebook/wav2vec2-base-960h", f"{base}/wav2vec2-base-960h", None),
 ]
@@ -114,6 +122,15 @@ if [ ! -d "$EM_DIR/.git" ]; then
   git clone --depth 1 https://github.com/antgroup/echomimic_v3 "$EM_DIR" 2>&1 | tail -3 | sed 's/^/       /'
 fi
 mkdir -p "$EM_MODELS"
+
+# Self-heal a volume written by the older local_dir bug: the transformer files landed one
+# level too deep (models/transformer/transformer/...). Move them up so an existing 3.4 GB
+# download is reused instead of re-fetched — and so the check below sees a complete set.
+if [ -f "$EM_MODELS/transformer/transformer/diffusion_pytorch_model.safetensors" ]; then
+  echo "     == repairing transformer path (older layout) =="
+  mv -f "$EM_MODELS/transformer/transformer/"* "$EM_MODELS/transformer/" 2>/dev/null
+  rmdir "$EM_MODELS/transformer/transformer" 2>/dev/null
+fi
 
 # ------------------------------------------------------- 2. weights, then venv
 # The weights check comes first and on its own, so the common restart case (weights on the
