@@ -18,7 +18,7 @@ Env in -> env out:
   EM_PROMPT  optional text prompt (defaults to a neutral speaking prompt)
   EM_REPO    EchoMimic checkout (default /workspace/echomimic_v3)
   EM_STEPS   sampling steps; 5 suits talking head, 15-25 for talking body
-  EM_PARTIAL frames per generation chunk (default 113); larger = more VRAM
+  EM_PARTIAL frames per generation chunk (default 49); larger = more VRAM, 113 OOMs a 48 GB card
 """
 
 from __future__ import annotations

@@ -466,7 +466,14 @@ def render_generate(job, work: Path):
         # 5 steps is the model's own recommendation for a talking head; 15-25 is for
         # talking body with hand gestures. Set EM_STEPS=20 on the pod for more motion.
         "EM_STEPS": os.environ.get("EM_STEPS", "5"),
-        "EM_PARTIAL": os.environ.get("EM_PARTIAL", "113"),
+        # 113 frames per chunk OOMs a 48 GB A40 at 768x768: peak was 42.5 GiB of 44.4 GiB
+        # and it died asking for 6.69 GiB more, ~4.5 minutes into generation (2026-09-20).
+        # VRAM scales with the chunk, so 49 roughly halves the peak. More chunks = slower,
+        # but a slow render beats an OOM. Raise it on a bigger card.
+        "EM_PARTIAL": os.environ.get("EM_PARTIAL", "49"),
+        # Fragmentation was a named factor in that OOM: 477 MiB was reserved-but-unallocated.
+        "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
+            "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True"),
         "EM_SEED": os.environ.get("EM_SEED", "43"),
     })
     log(f"  echomimic: steps={env['EM_STEPS']} chunk={env['EM_PARTIAL']} seed={env['EM_SEED']}")
@@ -515,7 +522,7 @@ def beacon():
             # otherwise only answerable by reading pod logs.
             "echomimic": {"repo": EM_REPO, "installed": Path(EM_PYTHON).exists(),
                           "steps": os.environ.get("EM_STEPS", "5"),
-                          "partial": os.environ.get("EM_PARTIAL", "113")},
+                          "partial": os.environ.get("EM_PARTIAL", "49")},
         }, timeout=30)
     except Exception as e:
         log("  beacon failed (non-fatal):", e)
