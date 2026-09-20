@@ -101,6 +101,57 @@ ensure_venv() {
   # tf-keras is harmless on TF 2.15, so this is safe whichever version the resolver picks.
   echo "     == tf-keras (retina-face imports tensorflow.keras, removed in TF 2.16) =="
   "$EM_VENV/bin/pip" install -q tf-keras 2>&1 | tail -2 | sed 's/^/       /'
+
+  # THIRD INSTANCE OF THE SAME PATTERN (found 2026-09-20): a co-installed package quietly
+  # replacing something torch was built against. TensorFlow ships its own nvidia-cudnn-cu12
+  # pin, which lands on top of the one torch 2.5.1 needs. Torch then loads a cuDNN whose
+  # symbols it does not match, and the FIRST conv3d — inside the Wan VAE, ~4 minutes into a
+  # render — dies with:
+  #     RuntimeError: cuDNN error: CUDNN_STATUS_NOT_INITIALIZED
+  # It is NOT out of memory: instrumentation showed 44.2 of 44.4 GiB free at that moment.
+  # The Chatterbox venv proves the diagnosis — same GPU, same CUDA, torch works there, and
+  # the only difference is that it has no TensorFlow in it.
+  #
+  # Ask torch which cuDNN it declares rather than hard-coding a version, so this keeps
+  # working when the pinned torch changes.
+  echo "     == restoring the cuDNN torch was built against (TensorFlow overwrote it) =="
+  want_cudnn="$("$EM_VENV/bin/python" - <<'PY' 2>/dev/null
+try:
+    import importlib.metadata as md
+    for r in md.requires("torch") or []:
+        head = r.split(";")[0].strip()
+        if head.startswith("nvidia-cudnn-cu12"):
+            print(head.replace(" ", "")); break
+except Exception:
+    pass
+PY
+)"
+  if [ -n "${want_cudnn:-}" ]; then
+    echo "       torch wants: $want_cudnn"
+    "$EM_VENV/bin/pip" install -q --force-reinstall --no-deps "$want_cudnn" 2>&1 | tail -2 | sed 's/^/       /'
+  else
+    echo "       !! could not read torch's cuDNN pin — leaving as installed"
+  fi
+
+  # Prove cuDNN actually works HERE, at install time, with the operation that was failing.
+  # Every bug in this path so far has surfaced four minutes into a render, after TTS had
+  # already run. A two-second conv3d now is worth a great deal.
+  "$EM_VENV/bin/python" - <<'PY' 2>&1 | sed 's/^/       /'
+import torch
+print(f"torch {torch.__version__} | cuda {torch.version.cuda} | cudnn {torch.backends.cudnn.version()}")
+if not torch.cuda.is_available():
+    print("!! no CUDA visible at install time — cannot verify cuDNN")
+else:
+    try:
+        x = torch.randn(1, 4, 4, 16, 16, device="cuda")
+        w = torch.randn(4, 4, 3, 3, 3, device="cuda")
+        torch.nn.functional.conv3d(x, w, padding=1)
+        torch.cuda.synchronize()
+        print("cuDNN conv3d smoke test OK — the Wan VAE path will run")
+    except Exception as e:
+        print(f"!! cuDNN conv3d FAILED: {type(e).__name__}: {e}")
+        print("!! a render would die in wan_vae.py; fix the venv before queueing a job")
+PY
   TF_USE_LEGACY_KERAS=1 "$EM_VENV/bin/python" - <<'PY' 2>&1 | sed 's/^/       /'
 import os
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")
