@@ -38,6 +38,30 @@ SCRIPT = REPO / "infer_preview.py"
 # something subtly wrong (e.g. a clip that is one chunk long and stops mid-sentence).
 ANCHOR = 'self.save_path = "outputs"'
 
+# Second anchor: the import that pulls in retina-face (and therefore TensorFlow). The shim
+# below has to land BEFORE it, because TensorFlow's visible-device list can only be changed
+# while no GPU has been initialised yet.
+FACE_ANCHOR = "from src.face_detect import get_mask_coord"
+
+TF_CPU_SHIM = """# ---- injected by em_driver.py: keep TensorFlow on the CPU ----
+# retina-face runs on TensorFlow, and TF's cuDNN does not match this container's CUDA 11.8 /
+# driver 570.x. The moment it touches the GPU it dies with:
+#     INTERNAL: No DNN support for stream [[{{node model/bn_data/FusedBatchNormV3}}]]
+# — after the Wan transformer has already loaded, so ~3.5 minutes in.
+#
+# Face detection is ONE forward pass over ONE still image; on CPU that costs a second or two.
+# The video diffusion that actually needs the GPU is PyTorch and is untouched by this.
+#
+# This must NOT be done with CUDA_VISIBLE_DEVICES: that variable would blind torch as well
+# and move the entire render onto the CPU.
+import tensorflow as _tf
+try:
+    _tf.config.set_visible_devices([], "GPU")
+    print("     em: TensorFlow pinned to CPU (retina-face only)", flush=True)
+except Exception as _e:  # already initialised, or no GPU to hide — harmless either way
+    print(f"     em: could not pin TensorFlow to CPU ({_e})", flush=True)
+"""
+
 OVERRIDES = """
         # ---- injected by em_driver.py ----
         import os as _os
@@ -106,13 +130,19 @@ def main() -> int:
         log("FATAL could not find the Config anchor in infer_preview.py — upstream changed; "
             "refusing to guess at paths")
         return 3
+    if FACE_ANCHOR not in src:
+        log("FATAL could not find the face_detect import in infer_preview.py — upstream "
+            "changed; refusing to run with TensorFlow loose on the GPU")
+        return 3
 
     # The patched copy must sit INSIDE the repo: the script does `from src... import ...`,
     # and python puts the *script's* directory on sys.path — not the working directory. A
     # copy in /tmp would fail to import src/ no matter what cwd we set.
     patched = REPO / "infer_eric.py"
-    patched.write_text(src.replace(ANCHOR, ANCHOR + OVERRIDES, 1))
-    log(f"patched Config -> {patched.name}")
+    body = src.replace(ANCHOR, ANCHOR + OVERRIDES, 1)
+    body = body.replace(FACE_ANCHOR, TF_CPU_SHIM + FACE_ANCHOR, 1)
+    patched.write_text(body)
+    log(f"patched Config + TF-CPU shim -> {patched.name}")
 
     env = dict(os.environ)
     env.update({
