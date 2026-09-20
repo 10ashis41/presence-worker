@@ -30,8 +30,11 @@ EM_MODELS="$EM_DIR/models"
 HF_HOME="${HF_HOME:-/workspace/hf-cache}"
 export HF_HOME HF_HUB_DISABLE_TELEMETRY=1
 
-# Only the weights must fit on the volume now: ~19 GB, plus headroom for the HF cache.
-NEED_GB="${EM_NEED_GB:-24}"
+# Only the weights must fit on the volume now: ~19 GB. Measured on a freshly provisioned
+# 50 GB volume: ~20 GB free after LatentSync, both venvs and the HF cache exist. The venv
+# (~7 GB) lives on the container disk and the pip cache no longer sits on the volume — those
+# two moves are what create the room.
+NEED_GB="${EM_NEED_GB:-20}"
 
 echo "     == disk =="
 df -h /workspace / 2>/dev/null | sed 's/^/       /'
@@ -42,7 +45,9 @@ df -h /workspace / 2>/dev/null | sed 's/^/       /'
 # rebuild into a disk copy instead of a download — and the venv now rebuilds every restart.
 if [ "${FREE_SPACE:-0}" = "1" ]; then
   echo "     == freeing space (FREE_SPACE=1) =="
-  for d in "${MUSETALK_DIR:-/workspace/MuseTalk}"; do
+  # /workspace/pip-cache is the OLD cache location: the cache now lives on the container disk
+  # (/opt/pip-cache), so any copy left on the volume from an earlier boot is dead weight.
+  for d in "${MUSETALK_DIR:-/workspace/MuseTalk}" /workspace/pip-cache; do
     if [ -e "$d" ]; then
       sz="$(du -sh "$d" 2>/dev/null | cut -f1)"
       rm -rf "$d"

@@ -43,10 +43,15 @@ echo "HF_HOME=$HF_HOME"
 # pip's cache also defaults to the container disk, which RunPod wipes on every
 # stop/restart — so torch (2.3 GB), mmcv and friends were being re-downloaded on
 # every single boot. That reinstall IS most of the ~10-minute provisioning time.
-# Pointing the cache at the persistent volume turns reinstalls into disk copies.
-export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/workspace/pip-cache}"
+#
+# It lives on the CONTAINER disk, not /workspace, on purpose: the volume is the scarce
+# resource (it must hold LatentSync, both venvs, the HF cache and EchoMimic's 19 GB of
+# weights, and a 50 GB volume has been ~4 GB short every single attempt). The cache is
+# re-creatable; the weights are not. Keeping it off-volume buys ~5 GB where it counts and
+# costs only the re-download of the EchoMimic venv, which is itself on the container disk.
+export PIP_CACHE_DIR="${PIP_CACHE_DIR:-/opt/pip-cache}"
 mkdir -p "$PIP_CACHE_DIR"
-echo "PIP_CACHE_DIR=$PIP_CACHE_DIR"
+echo "PIP_CACHE_DIR=$PIP_CACHE_DIR (container disk — keeps the volume free for weights)"
 
 say "1/6  system packages"
 apt-get update -qq
@@ -248,15 +253,42 @@ else
 fi
 
 say "7/7  smoke check"
-python - <<'EOF'
-import torch
-print(f"     torch {torch.__version__}  cuda={torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"     gpu: {torch.cuda.get_device_name(0)}  "
-          f"{torch.cuda.get_device_properties(0).total_memory/1e9:.0f} GB")
-else:
-    raise SystemExit("     NO GPU VISIBLE — the render will fail. Check the pod.")
-EOF
+# Probe EVERY torch that might do work, and only abort if none of them can see the GPU.
+#
+# Why: the old check asserted the IMAGE's torch must see the GPU, and on an RTX 4090 host it
+# did not — "torch 2.1.0+cu118 cuda=False ... CUDA unknown error" — so the script exited 1,
+# the entrypoint fell through to `sleep infinity`, and the pod ran for half an hour with NO
+# worker while still billing. The image's torch does no rendering at all: Chatterbox and
+# LatentSync each run from their own venv with their own newer torch. A stale image torch is
+# therefore a fact to report, not a reason to abandon a GPU we are paying for.
+probe_torch() {
+  _py="$1"; _label="$2"
+  if [ ! -x "$_py" ]; then echo "     $_label: no interpreter at $_py"; return 1; fi
+  "$_py" -c "
+import sys, torch
+try:
+    ok = torch.cuda.is_available()
+    name = torch.cuda.get_device_name(0) if ok else ''
+    mem = f'{torch.cuda.get_device_properties(0).total_memory/1e9:.0f} GB' if ok else ''
+    print(f'     $_label: torch {torch.__version__}  cuda={ok}  {name} {mem}')
+    sys.exit(0 if ok else 1)
+except Exception as e:
+    print(f'     $_label: probe failed — {type(e).__name__}: {e}')
+    sys.exit(1)
+"
+}
+
+cuda_ok=0
+probe_torch "$(command -v python)" "system" && cuda_ok=1
+probe_torch "${CB_VENV:-/workspace/cbvenv}/bin/python" "chatterbox venv" && cuda_ok=1
+probe_torch "${LS_VENV:-/workspace/lsvenv}/bin/python" "latentsync venv" && cuda_ok=1
+
+if [ "$cuda_ok" = "1" ]; then
+  echo "     at least one environment sees the GPU — the render path is viable"
+else
+  echo "     NO ENVIRONMENT CAN SEE THE GPU — a render would fail. Check the pod's driver."
+  exit 1
+fi
 ffmpeg -version | head -1 | sed 's/^/     /'
 
 say "starting worker — it will poll $API_BASE for jobs"
